@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "yahoo-mail": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "yahoo_imap_mcp.server"],
+      "env": {
+        "PYTHONPATH": "/Users/aaronbruneau/VSCodeProjects/Yahoo_IMAP_MCP/src"
+      }
+    }
+  }
+}
