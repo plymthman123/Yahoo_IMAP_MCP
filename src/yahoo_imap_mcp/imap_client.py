@@ -6,10 +6,17 @@ execute → logout) to avoid Yahoo's aggressive idle-session timeouts.
 All IMAP commands use UIDs (not sequence numbers) for stability.
 """
 import imaplib
+import os
 import ssl
 import re
+import sys
 from contextlib import contextmanager
 from typing import Generator
+
+
+def _log(msg: str) -> None:
+    if os.environ.get("YAHOO_MCP_DEBUG"):
+        print(f"[yahoo-imap] {msg}", file=sys.stderr, flush=True)
 
 from . import config
 
@@ -22,13 +29,16 @@ from . import config
 def imap_connection() -> Generator[imaplib.IMAP4_SSL, None, None]:
     """Open an authenticated IMAP4_SSL connection; logout on exit."""
     ssl_context = ssl.create_default_context()
+    _log(f"Connecting to {config.IMAP_HOST}:{config.IMAP_PORT}")
     conn = imaplib.IMAP4_SSL(config.IMAP_HOST, config.IMAP_PORT, ssl_context=ssl_context)
     try:
         conn.login(config.YAHOO_EMAIL, config.YAHOO_APP_PASSWORD)
+        _log("IMAP login successful")
         yield conn
     finally:
         try:
             conn.logout()
+            _log("IMAP logout")
         except Exception:
             pass
 
@@ -39,6 +49,7 @@ def imap_connection() -> Generator[imaplib.IMAP4_SSL, None, None]:
 
 def list_folders() -> list[dict]:
     """Return all IMAP folders as a list of dicts with 'name' and 'flags'."""
+    _log("list_folders()")
     with imap_connection() as conn:
         status, folder_list = conn.list()
         if status != "OK":
@@ -79,11 +90,14 @@ def _fetch_envelopes(conn: imaplib.IMAP4_SSL, uid_list: list[bytes]) -> list[dic
         raise RuntimeError(f"IMAP FETCH envelope failed: {data}")
 
     emails = []
-    # data is a flat list; each message is a tuple (header_bytes, None) pair
+    # data is a flat list; ENVELOPE fetches return bytes items, not tuples
     for item in data:
-        if not isinstance(item, tuple):
+        if isinstance(item, tuple):
+            raw = item[0].decode("utf-8", errors="replace") if isinstance(item[0], bytes) else str(item[0])
+        elif isinstance(item, bytes):
+            raw = item.decode("utf-8", errors="replace")
+        else:
             continue
-        raw = item[0].decode("utf-8", errors="replace") if isinstance(item[0], bytes) else str(item[0])
 
         uid_match = re.search(r"UID (\d+)", raw)
         size_match = re.search(r"RFC822\.SIZE (\d+)", raw)
@@ -124,6 +138,7 @@ def list_emails(folder: str, limit: int, offset: int) -> dict:
     List emails in a folder newest-first with pagination.
     Returns {"emails": [...], "total": int, "has_more": bool}.
     """
+    _log(f"list_emails(folder={folder!r}, limit={limit}, offset={offset})")
     with imap_connection() as conn:
         conn.select(f'"{folder}"', readonly=True)
         status, data = conn.uid("SEARCH", None, "ALL")
@@ -132,9 +147,11 @@ def list_emails(folder: str, limit: int, offset: int) -> dict:
 
         all_uids = data[0].split() if data[0] else []
         total = len(all_uids)
+        _log(f"Found {total} emails in {folder!r}, fetching {limit} from offset {offset}")
         # Reverse so index 0 = newest
         sliced = list(reversed(all_uids))[offset: offset + limit]
         emails = _fetch_envelopes(conn, sliced)
+        _log(f"Returning {len(emails)} emails")
         return {"emails": emails, "total": total, "has_more": (offset + limit) < total}
 
 
@@ -166,6 +183,7 @@ def search_emails(
         criteria_parts.append(f"BEFORE {before}")
 
     search_str = " ".join(criteria_parts) if criteria_parts else "ALL"
+    _log(f"search_emails(folder={folder!r}, criteria={search_str!r}, limit={limit}, offset={offset})")
 
     with imap_connection() as conn:
         conn.select(f'"{folder}"', readonly=True)
@@ -175,8 +193,10 @@ def search_emails(
 
         all_uids = data[0].split() if data[0] else []
         total = len(all_uids)
+        _log(f"Search returned {total} results, fetching {limit} from offset {offset}")
         sliced = list(reversed(all_uids))[offset: offset + limit]
         emails = _fetch_envelopes(conn, sliced)
+        _log(f"Returning {len(emails)} emails")
         return {"emails": emails, "total": total, "has_more": (offset + limit) < total}
 
 
@@ -189,10 +209,12 @@ def read_email(uid: str, folder: str) -> bytes:
     Fetch the raw RFC822 bytes for a single email by UID.
     Raises ValueError if not found.
     """
+    _log(f"read_email(uid={uid!r}, folder={folder!r})")
     with imap_connection() as conn:
         conn.select(f'"{folder}"', readonly=True)
         status, data = conn.uid("FETCH", uid, "(RFC822)")
         if status != "OK" or not data or data[0] is None:
+            _log(f"ERROR: Email UID {uid} not found in {folder!r}")
             raise ValueError(f"Email UID {uid} not found in folder '{folder}'")
         # data[0] is a tuple: (b'uid FLAGS...', b'<raw RFC822 bytes>')
         if isinstance(data[0], tuple):
@@ -206,6 +228,7 @@ def read_email(uid: str, folder: str) -> bytes:
 
 def mark_email_flags(uid: str, folder: str, flags: str, add: bool = True) -> None:
     """Add or remove IMAP flags (e.g. r'(\Seen)', r'(\Flagged)')."""
+    _log(f"mark_email_flags(uid={uid!r}, folder={folder!r}, flags={flags!r}, add={add})")
     with imap_connection() as conn:
         conn.select(f'"{folder}"')
         op = "+FLAGS" if add else "-FLAGS"
@@ -213,6 +236,7 @@ def mark_email_flags(uid: str, folder: str, flags: str, add: bool = True) -> Non
 
 
 def move_email(uid: str, source_folder: str, dest_folder: str) -> None:
+    _log(f"move_email(uid={uid!r}, from={source_folder!r}, to={dest_folder!r})")
     """
     Move an email to dest_folder.
     Tries the IMAP MOVE extension (RFC 6851) first; falls back to COPY + DELETE.
