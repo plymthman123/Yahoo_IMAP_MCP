@@ -14,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import config, imap_client, smtp_client, email_parser, email_builder
 
-mcp = FastMCP(name="yahoo-mail", version="1.0.0")
+mcp = FastMCP(name="yahoo-mail")
 
 # Thread pool for blocking IMAP/SMTP calls (max 3 concurrent connections)
 _executor = ThreadPoolExecutor(max_workers=3)
