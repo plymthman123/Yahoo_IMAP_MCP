@@ -2,18 +2,32 @@
 SMTP client for Yahoo Mail.
 Uses port 465 with SMTP_SSL (SSL from connection start), not STARTTLS.
 """
+import logging
+import logging.handlers
 import os
+import socket
 import smtplib
 import ssl
-import sys
 from email.mime.multipart import MIMEMultipart
 
 from . import config
 
+_logger = logging.getLogger("yahoo-smtp")
+if not _logger.handlers:
+    _handler = logging.handlers.SysLogHandler(
+        address="/var/run/syslog",
+        facility=logging.handlers.SysLogHandler.LOG_LOCAL0,
+        socktype=socket.SOCK_DGRAM,
+    )
+    _handler.ident = "yahoo-smtp: "
+    _logger.addHandler(_handler)
+    _logger.propagate = False
+
+_logger.setLevel(logging.DEBUG if os.environ.get("YAHOO_MCP_DEBUG") else logging.WARNING)
+
 
 def _log(msg: str) -> None:
-    if os.environ.get("YAHOO_MCP_DEBUG"):
-        print(f"[yahoo-smtp] {msg}", file=sys.stderr, flush=True)
+    _logger.debug(msg)
 
 
 def send_message(msg: MIMEMultipart) -> dict:

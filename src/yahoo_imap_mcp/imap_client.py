@@ -6,17 +6,31 @@ execute → logout) to avoid Yahoo's aggressive idle-session timeouts.
 All IMAP commands use UIDs (not sequence numbers) for stability.
 """
 import imaplib
+import logging
+import logging.handlers
 import os
+import socket
 import ssl
 import re
-import sys
 from contextlib import contextmanager
 from typing import Generator
 
+_logger = logging.getLogger("yahoo-imap")
+if not _logger.handlers:
+    _handler = logging.handlers.SysLogHandler(
+        address="/var/run/syslog",
+        facility=logging.handlers.SysLogHandler.LOG_LOCAL0,
+        socktype=socket.SOCK_DGRAM,
+    )
+    _handler.ident = "yahoo-imap: "
+    _logger.addHandler(_handler)
+    _logger.propagate = False
+
+_logger.setLevel(logging.DEBUG if os.environ.get("YAHOO_MCP_DEBUG") else logging.WARNING)
+
 
 def _log(msg: str) -> None:
-    if os.environ.get("YAHOO_MCP_DEBUG"):
-        print(f"[yahoo-imap] {msg}", file=sys.stderr, flush=True)
+    _logger.debug(msg)
 
 from . import config
 
