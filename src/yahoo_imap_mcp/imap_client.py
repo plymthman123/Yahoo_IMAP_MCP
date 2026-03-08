@@ -26,11 +26,11 @@ if not _logger.handlers:
     _logger.addHandler(_handler)
     _logger.propagate = False
 
-_logger.setLevel(logging.DEBUG if os.environ.get("YAHOO_MCP_DEBUG") else logging.WARNING)
+_logger.setLevel(logging.DEBUG if os.environ.get("YAHOO_MCP_DEBUG") else logging.INFO)
 
 
 def _log(msg: str) -> None:
-    _logger.debug(msg)
+    _logger.info(msg)
 
 from . import config
 
