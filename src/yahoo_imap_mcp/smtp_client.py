@@ -15,7 +15,7 @@ from . import config
 _logger = logging.getLogger("yahoo-smtp")
 if not _logger.handlers:
     _handler = logging.handlers.SysLogHandler(
-        address="/var/run/syslog",
+        address="/var/run/syslog-ng-custom.sock",
         facility=logging.handlers.SysLogHandler.LOG_LOCAL0,
         socktype=socket.SOCK_DGRAM,
     )
