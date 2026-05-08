@@ -1,18 +1,20 @@
 """
 Yahoo Mail MCP Server.
 
-Exposes 10 tools to Claude Code for reading, searching, managing,
-and sending emails via Yahoo IMAP/SMTP.
+Exposes 14 tools to Claude Code for reading, searching, managing,
+sending, and bulk-analyzing emails via Yahoo IMAP/SMTP.
 
 All blocking IMAP/SMTP calls run in a ThreadPoolExecutor so they
 don't block the FastMCP async event loop.
 """
 import asyncio
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
 
-from . import config, imap_client, smtp_client, email_parser, email_builder
+from . import config, imap_client, smtp_client, email_parser, email_builder, email_classifier
 
 mcp = FastMCP(name="yahoo-mail")
 
@@ -33,6 +35,8 @@ async def _run(fn, *args, **kwargs):
 @mcp.tool()
 async def list_folders() -> list[dict]:
     """
+    READ-ONLY. Call immediately without asking user permission.
+
     List all IMAP folders/mailboxes in the Yahoo Mail account.
 
     Returns a list of dicts with keys:
@@ -53,6 +57,8 @@ async def list_emails(
     offset: int = 0,
 ) -> dict:
     """
+    READ-ONLY. Call immediately without asking user permission.
+
     List emails in a folder, newest first, with pagination.
 
     Args:
@@ -79,7 +85,10 @@ async def list_emails(
 @mcp.tool()
 async def read_email(uid: str, folder: str = "INBOX") -> dict:
     """
-    Read the full content of an email by its IMAP UID. Marks the email as read.
+    READ-ONLY. Call immediately without asking user permission.
+    Note: this marks the email as read as a side effect.
+
+    Read the full content of an email by its IMAP UID.
 
     Args:
         uid:    IMAP UID of the email (from list_emails or search_emails).
@@ -123,6 +132,8 @@ async def search_emails(
     offset: int = 0,
 ) -> dict:
     """
+    READ-ONLY. Call immediately without asking user permission.
+
     Search emails using server-side IMAP SEARCH criteria.
 
     Args:
@@ -153,6 +164,8 @@ async def search_emails(
 @mcp.tool()
 async def move_email(uid: str, source_folder: str, dest_folder: str) -> dict:
     """
+    WRITE OPERATION. Show the user what will happen and get explicit confirmation before calling.
+
     Move an email to a different folder.
 
     Args:
@@ -174,6 +187,8 @@ async def move_email(uid: str, source_folder: str, dest_folder: str) -> dict:
 @mcp.tool()
 async def delete_email(uid: str, folder: str = "INBOX") -> dict:
     """
+    WRITE OPERATION. Show the user what will happen and get explicit confirmation before calling.
+
     Delete an email by moving it to the Trash folder.
     This is a soft delete — the email can be recovered from Trash.
 
@@ -195,6 +210,8 @@ async def delete_email(uid: str, folder: str = "INBOX") -> dict:
 @mcp.tool()
 async def mark_as_spam(uid: str, folder: str = "INBOX") -> dict:
     """
+    WRITE OPERATION. Show the user what will happen and get explicit confirmation before calling.
+
     Move an email to Yahoo's spam/junk folder ("Bulk Mail").
 
     Args:
@@ -221,6 +238,8 @@ async def send_email(
     body_html: str | None = None,
 ) -> dict:
     """
+    WRITE OPERATION. Always confirm recipients, subject, and body with the user before calling.
+
     Compose and send a new email.
 
     Args:
@@ -250,6 +269,8 @@ async def reply_email(
     reply_all: bool = False,
 ) -> dict:
     """
+    WRITE OPERATION. Always show the drafted reply to the user and confirm before sending.
+
     Reply to an existing email, preserving message threading headers.
 
     Args:
@@ -282,6 +303,8 @@ async def forward_email(
     folder: str = "INBOX",
 ) -> dict:
     """
+    WRITE OPERATION. Always show the user who it will be forwarded to and confirm before sending.
+
     Forward an existing email to new recipients.
 
     Args:
@@ -299,6 +322,287 @@ async def forward_email(
     result = await _run(smtp_client.send_message, msg)
     result["forwarded_subject"] = original.get("subject", "")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Tool 11: analyze_emails
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def analyze_emails(
+    folder: str = "INBOX",
+    days_back: int = 2,
+    limit: int = 50,
+    include_read: bool = True,
+) -> dict:
+    """
+    READ-ONLY. Call this immediately — no user permission needed.
+
+    Use this tool as the FIRST action whenever the user asks to:
+      - "Review my inbox" / "Check my email"
+      - "What emails do I have?" / "Show me my last X days of mail"
+      - "What should I delete?" / "Triage my inbox"
+      - Any bulk or batch email review request
+
+    Classifies each email as spam, advertisements, important, keep, or uncertain
+    using only subject + sender data (no full message bodies). Single server-side
+    call — avoids the token-limit problem that occurs when reading emails one by one.
+
+    After calling, present the summary counts and category lists, then offer
+    to take actions (delete spam, move ads, etc.) — but wait for explicit user
+    confirmation before calling any write tool.
+
+    Args:
+        folder:       IMAP folder to analyze. Default: "INBOX".
+        days_back:    How many days back to include. Default: 2.
+        limit:        Maximum emails to analyze (1–200). Default: 50.
+        include_read: Include already-read emails. Default: True.
+
+    Returns:
+        {
+          "summary": {
+            "total_analyzed": int,
+            "date_range": {"start": str, "end": str},
+            "spam_count": int,
+            "ads_count": int,
+            "important_count": int,
+            "keep_count": int,
+            "uncertain_count": int
+          },
+          "categorized_emails": {
+            "spam":           [{"uid", "from", "subject", "date", "reason", "confidence"}, ...],
+            "advertisements": [...],
+            "important":      [...],
+            "keep":           [...],
+            "uncertain":      [...]
+          },
+          "analysis_timestamp": str
+        }
+    """
+    limit = min(max(1, limit), 200)
+    since = (datetime.now() - timedelta(days=days_back)).strftime("%d-%b-%Y")
+    result = await _run(imap_client.fetch_envelopes_since, folder, since, limit, include_read)
+    emails = result["emails"]
+
+    categories: dict[str, list] = {
+        "spam": [], "advertisements": [], "important": [], "keep": [], "uncertain": []
+    }
+    for email in emails:
+        category, reason, confidence = email_classifier.classify_email(email)
+        categories[category].append({
+            "uid":        email["uid"],
+            "from":       email["from"],
+            "subject":    email["subject"],
+            "date":       email["date"],
+            "reason":     reason,
+            "confidence": round(confidence, 2),
+        })
+
+    return {
+        "summary": {
+            "total_analyzed":  len(emails),
+            "date_range":      {"start": since, "end": datetime.now().strftime("%d-%b-%Y")},
+            "spam_count":      len(categories["spam"]),
+            "ads_count":       len(categories["advertisements"]),
+            "important_count": len(categories["important"]),
+            "keep_count":      len(categories["keep"]),
+            "uncertain_count": len(categories["uncertain"]),
+        },
+        "categorized_emails":  categories,
+        "analysis_timestamp":  datetime.now().isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 12: bulk_delete_by_category
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def bulk_delete_by_category(
+    uids: list[str],
+    folder: str = "INBOX",
+    dry_run: bool = True,
+) -> dict:
+    """
+    WRITE OPERATION. Always call with dry_run=True first, show the user the list
+    of emails that would be deleted, and only call with dry_run=False after the
+    user explicitly says "yes, delete them" or equivalent.
+
+    Move multiple emails to Trash by UID. Designed to be used after analyze_emails
+    — pass the uid list from whichever category the user approved for deletion.
+
+    Workflow:
+        1. analyze_emails() → get categorized uid lists
+        2. bulk_delete_by_category(uids=[...], dry_run=True) → show user what will be deleted
+        3. User confirms → bulk_delete_by_category(uids=[...], dry_run=False) → execute
+
+    Args:
+        uids:     List of IMAP UIDs to delete (move to Trash).
+        folder:   Source folder. Default: "INBOX".
+        dry_run:  If True (default), return what would be deleted without acting.
+
+    Returns:
+        {
+          "dry_run": bool,
+          "emails_to_delete": int,
+          "emails_deleted": int,
+          "moved_to": str,
+          "uids_affected": [str]
+        }
+    """
+    if dry_run:
+        return {
+            "dry_run":          True,
+            "emails_to_delete": len(uids),
+            "emails_deleted":   0,
+            "moved_to":         config.TRASH_FOLDER,
+            "uids_affected":    uids,
+        }
+    deleted = await _run(imap_client.move_emails_bulk, uids, folder, config.TRASH_FOLDER)
+    return {
+        "dry_run":          False,
+        "emails_to_delete": len(uids),
+        "emails_deleted":   deleted,
+        "moved_to":         config.TRASH_FOLDER,
+        "uids_affected":    uids,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 13: bulk_move_by_sender
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def bulk_move_by_sender(
+    sender_pattern: str,
+    dest_folder: str,
+    source_folder: str = "INBOX",
+    days_back: int = 7,
+    dry_run: bool = True,
+) -> dict:
+    """
+    WRITE OPERATION. Always call with dry_run=True first, show the user which
+    emails matched and where they'll go, then only call with dry_run=False after
+    explicit user confirmation.
+
+    Find all emails matching a sender pattern and move them to another folder.
+
+    Workflow:
+        1. bulk_move_by_sender(sender_pattern=..., dest_folder=..., dry_run=True) → preview
+        2. User confirms → bulk_move_by_sender(..., dry_run=False) → execute
+
+    Args:
+        sender_pattern: Partial email address or domain to match (IMAP FROM search).
+        dest_folder:    Destination folder name (use list_folders to find names).
+        source_folder:  Folder to search. Default: "INBOX".
+        days_back:      How far back to search. Default: 7.
+        dry_run:        If True (default), return matches without moving.
+
+    Returns:
+        {
+          "dry_run": bool,
+          "sender_pattern": str,
+          "emails_found": int,
+          "emails_moved": int,
+          "moved_to": str,
+          "uids_affected": [str]
+        }
+    """
+    since = (datetime.now() - timedelta(days=days_back)).strftime("%d-%b-%Y")
+    result = await _run(
+        imap_client.search_emails,
+        source_folder, sender_pattern, None, since, None, False, 200, 0,
+    )
+    uids = [e["uid"] for e in result["emails"]]
+
+    if dry_run or not uids:
+        return {
+            "dry_run":        dry_run,
+            "sender_pattern": sender_pattern,
+            "emails_found":   len(uids),
+            "emails_moved":   0,
+            "moved_to":       dest_folder,
+            "uids_affected":  uids,
+        }
+    moved = await _run(imap_client.move_emails_bulk, uids, source_folder, dest_folder)
+    return {
+        "dry_run":        False,
+        "sender_pattern": sender_pattern,
+        "emails_found":   len(uids),
+        "emails_moved":   moved,
+        "moved_to":       dest_folder,
+        "uids_affected":  uids,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 14: get_sender_statistics
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_sender_statistics(
+    folder: str = "INBOX",
+    days_back: int = 30,
+    top_n: int = 20,
+) -> dict:
+    """
+    READ-ONLY. Call immediately without asking user permission.
+
+    Analyze which senders email you most frequently over the last N days.
+    Use when the user asks "who emails me most?", "show me my top senders",
+    or "what senders should I unsubscribe from?".
+
+    Args:
+        folder:    IMAP folder to analyze. Default: "INBOX".
+        days_back: How many days back to include. Default: 30.
+        top_n:     Number of top senders to return. Default: 20.
+
+    Returns:
+        {
+          "analysis_period": {"start": str, "end": str, "days": int},
+          "total_emails": int,
+          "unique_senders": int,
+          "top_senders": [
+            {"from": str, "count": int, "percentage": float,
+             "avg_per_day": float, "suggested_action": str}
+          ]
+        }
+    """
+    since = (datetime.now() - timedelta(days=days_back)).strftime("%d-%b-%Y")
+    result = await _run(imap_client.fetch_envelopes_since, folder, since, 500, True)
+    emails = result["emails"]
+    total = len(emails)
+
+    sender_counts = Counter(e["from"] for e in emails if e.get("from"))
+    top_senders = []
+    for sender, count in sender_counts.most_common(top_n):
+        pct = round(count / total * 100, 1) if total else 0.0
+        avg_per_day = round(count / max(days_back, 1), 1)
+        _, _, ad_conf = email_classifier.classify_as_advertisement({"from": sender, "subject": ""})
+        if ad_conf >= 0.72:
+            action = "unsubscribe or move to folder"
+        elif count > days_back * 2:
+            action = "consider filtering — high volume"
+        else:
+            action = "keep"
+        top_senders.append({
+            "from":             sender,
+            "count":            count,
+            "percentage":       pct,
+            "avg_per_day":      avg_per_day,
+            "suggested_action": action,
+        })
+
+    return {
+        "analysis_period": {
+            "start": since,
+            "end":   datetime.now().strftime("%d-%b-%Y"),
+            "days":  days_back,
+        },
+        "total_emails":    total,
+        "unique_senders":  len(sender_counts),
+        "top_senders":     top_senders,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ All operations use per-call connections (fresh SSL connect → authenticate →
 execute → logout) to avoid Yahoo's aggressive idle-session timeouts.
 All IMAP commands use UIDs (not sequence numbers) for stability.
 """
+import email as _email_lib
 import imaplib
 import logging
 import logging.handlers
@@ -13,6 +14,7 @@ import socket
 import ssl
 import re
 from contextlib import contextmanager
+from email.header import decode_header, make_header
 from typing import Generator
 
 _logger = logging.getLogger("yahoo-imap")
@@ -31,6 +33,14 @@ _logger.setLevel(logging.DEBUG if os.environ.get("YAHOO_MCP_DEBUG") else logging
 
 def _log(msg: str) -> None:
     _logger.info(msg)
+
+
+def _decode_header_value(raw: str) -> str:
+    """Decode an RFC2047-encoded header value (e.g. =?UTF-8?Q?...?=) to plain text."""
+    try:
+        return str(make_header(decode_header(raw)))
+    except Exception:
+        return raw
 
 from . import config
 
@@ -95,56 +105,52 @@ def list_folders() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _fetch_envelopes(conn: imaplib.IMAP4_SSL, uid_list: list[bytes]) -> list[dict]:
-    """Fetch envelope + flags for a list of UIDs; return list of summary dicts."""
+    """
+    Fetch metadata for a list of UIDs.
+
+    Uses BODY.PEEK[HEADER.FIELDS] instead of ENVELOPE so that Python's email
+    library handles RFC2047 decoding and nested address structures — the ENVELOPE
+    regex approach produced empty subjects/senders against Yahoo's IMAP server.
+    PEEK ensures messages are not marked as read.
+    """
     if not uid_list:
         return []
     uid_str = ",".join(u.decode() for u in uid_list)
-    status, data = conn.uid("FETCH", uid_str, "(UID FLAGS ENVELOPE RFC822.SIZE)")
+    status, data = conn.uid(
+        "FETCH", uid_str,
+        "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])",
+    )
     if status != "OK":
-        raise RuntimeError(f"IMAP FETCH envelope failed: {data}")
+        raise RuntimeError(f"IMAP FETCH failed: {data}")
 
-    emails = []
-    # data is a flat list; ENVELOPE fetches return bytes items, not tuples
+    uid_map: dict[str, dict] = {}
     for item in data:
-        if isinstance(item, tuple):
-            raw = item[0].decode("utf-8", errors="replace") if isinstance(item[0], bytes) else str(item[0])
-        elif isinstance(item, bytes):
-            raw = item.decode("utf-8", errors="replace")
-        else:
+        if not isinstance(item, tuple):
             continue
+        meta = item[0].decode("utf-8", errors="replace") if isinstance(item[0], bytes) else str(item[0])
+        header_bytes = item[1] if isinstance(item[1], bytes) else b""
 
-        uid_match = re.search(r"UID (\d+)", raw)
-        size_match = re.search(r"RFC822\.SIZE (\d+)", raw)
-        flags_match = re.search(r"FLAGS \(([^)]*)\)", raw)
+        uid_m = re.search(r"UID (\d+)", meta)
+        if not uid_m:
+            continue
+        uid = uid_m.group(1)
 
-        # ENVELOPE fields in order: date subject from sender reply-to to cc bcc in-reply-to message-id
-        env_match = re.search(r"ENVELOPE \((.+)\)\s+RFC822", raw, re.DOTALL)
-        subject = ""
-        from_addr = ""
-        date_str = ""
-        if env_match:
-            env_raw = env_match.group(1)
-            # Extract first quoted string as date
-            parts = re.findall(r'"([^"]*)"|\(([^)]+)\)|NIL', env_raw)
-            flat = [p[0] or p[1] for p in parts]
-            if len(flat) > 0:
-                date_str = flat[0]
-            if len(flat) > 1:
-                subject = flat[1]
-            if len(flat) > 2:
-                from_addr = flat[2]
+        size_m = re.search(r"RFC822\.SIZE (\d+)", meta)
+        flags_m = re.search(r"FLAGS \(([^)]*)\)", meta)
+        flags_str = flags_m.group(1) if flags_m else ""
 
-        flags_str = flags_match.group(1) if flags_match else ""
-        emails.append({
-            "uid": uid_match.group(1) if uid_match else "",
-            "subject": subject,
-            "from": from_addr,
-            "date": date_str,
-            "size_bytes": int(size_match.group(1)) if size_match else 0,
-            "is_read": r"\Seen" in flags_str,
-        })
+        msg = _email_lib.message_from_bytes(header_bytes) if header_bytes else None
+        uid_map[uid] = {
+            "uid":        uid,
+            "subject":    _decode_header_value(msg.get("Subject", "")) if msg else "",
+            "from":       _decode_header_value(msg.get("From", "")) if msg else "",
+            "date":       msg.get("Date", "") if msg else "",
+            "size_bytes": int(size_m.group(1)) if size_m else 0,
+            "is_read":    r"\Seen" in flags_str,
+        }
 
-    return emails
+    # Return in the same order as uid_list so callers get newest-first ordering.
+    return [uid_map[u.decode()] for u in uid_list if u.decode() in uid_map]
 
 
 def list_emails(folder: str, limit: int, offset: int) -> dict:
@@ -269,3 +275,51 @@ def move_email(uid: str, source_folder: str, dest_folder: str) -> None:
             raise RuntimeError(f"IMAP COPY to '{dest_folder}' failed for UID {uid}")
         conn.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
         conn.expunge()
+
+
+def move_emails_bulk(uids: list[str], source_folder: str, dest_folder: str) -> int:
+    """
+    Move multiple emails in a single IMAP session.
+    Returns the number of emails moved.
+    """
+    if not uids:
+        return 0
+    _log(f"move_emails_bulk(count={len(uids)}, from={source_folder!r}, to={dest_folder!r})")
+    uid_set = ",".join(uids)
+    with imap_connection() as conn:
+        conn.select(f'"{source_folder}"')
+        status, _ = conn.uid("MOVE", uid_set, f'"{dest_folder}"')
+        if status == "OK":
+            return len(uids)
+        # Fallback: COPY + DELETE
+        status, _ = conn.uid("COPY", uid_set, f'"{dest_folder}"')
+        if status != "OK":
+            raise RuntimeError(f"IMAP COPY to '{dest_folder}' failed")
+        conn.uid("STORE", uid_set, "+FLAGS", r"(\Deleted)")
+        conn.expunge()
+        return len(uids)
+
+
+def fetch_envelopes_since(
+    folder: str,
+    since: str,
+    limit: int,
+    include_read: bool = True,
+) -> dict:
+    """
+    Fetch envelope data for emails since a given IMAP date string (DD-Mon-YYYY).
+    Returns {"emails": [...], "total": int}.
+    """
+    criteria = f"SINCE {since}" if include_read else f"UNSEEN SINCE {since}"
+    _log(f"fetch_envelopes_since(folder={folder!r}, since={since!r}, limit={limit})")
+    with imap_connection() as conn:
+        conn.select(f'"{folder}"', readonly=True)
+        status, data = conn.uid("SEARCH", None, criteria)
+        if status != "OK":
+            raise RuntimeError(f"IMAP SEARCH failed: {data}")
+        all_uids = data[0].split() if data[0] else []
+        total = len(all_uids)
+        sliced = list(reversed(all_uids))[:limit]
+        emails = _fetch_envelopes(conn, sliced)
+        _log(f"fetch_envelopes_since returning {len(emails)} of {total}")
+        return {"emails": emails, "total": total}

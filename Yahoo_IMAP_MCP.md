@@ -14,11 +14,13 @@ Yahoo_IMAP_MCP/
 ├── .mcp.json                     # Project-scoped Claude Code MCP registration
 ├── requirements.txt
 ├── Yahoo_IMAP_MCP.md             # This file
+├── bulk_mail_tool_feature.md     # Design spec for the bulk analysis feature
 └── src/
     └── yahoo_imap_mcp/
         ├── __init__.py
-        ├── server.py             # FastMCP entry point + all 10 @tool decorators
+        ├── server.py             # FastMCP entry point + all 14 @tool decorators
         ├── imap_client.py        # All IMAP operations (per-call connections, UID-based)
+        ├── email_classifier.py   # Heuristic spam/ad/important classifier (no API calls)
         ├── smtp_client.py        # SMTP send via port 465 SSL
         ├── email_parser.py       # RFC822 → structured dict (MIME, HTML→text, headers)
         ├── email_builder.py      # Build MIME messages for send/reply/forward
@@ -53,7 +55,7 @@ cp .env.example .env
 # Edit .env and fill in your email and app password
 
 # 3. Test the server starts
-PYTHONPATH=src python3 -m yahoo_imap_mcp.server
+PYTHONPATH=src python -m yahoo_imap_mcp.server
 
 # 4. Register with Claude Code (project scope via .mcp.json is automatic)
 # OR register as user-scoped so it's available in all projects:
@@ -70,6 +72,8 @@ claude mcp list
 
 ## Available MCP Tools
 
+### Single-email tools
+
 | Tool | Description |
 |------|-------------|
 | `list_folders` | List all IMAP folders/mailboxes |
@@ -82,6 +86,31 @@ claude mcp list
 | `send_email` | Compose and send a new email |
 | `reply_email` | Reply preserving In-Reply-To/References threading |
 | `forward_email` | Forward with original headers quoted in body |
+
+### Bulk analysis tools
+
+| Tool | Args | Description |
+|------|------|-------------|
+| `analyze_emails` | `folder`, `days_back`, `limit` (≤200), `include_read` | Classify emails as spam / ads / important / keep / uncertain using envelope data only. Returns counts + per-category UID lists. |
+| `bulk_delete_by_category` | `uids`, `folder`, `dry_run` (default `True`) | Move a list of UIDs to Trash. Always confirm with `dry_run=True` first. |
+| `bulk_move_by_sender` | `sender_pattern`, `dest_folder`, `source_folder`, `days_back`, `dry_run` | Find emails matching a sender and move them in bulk. |
+| `get_sender_statistics` | `folder`, `days_back`, `top_n` | Rank senders by volume; includes suggested action per sender. |
+
+#### Typical bulk review flow
+
+```
+1. analyze_emails(days_back=2, limit=50)
+   → returns categorized email lists with UIDs
+
+2. bulk_delete_by_category(uids=[...spam UIDs...], dry_run=True)
+   → preview what would be deleted
+
+3. bulk_delete_by_category(uids=[...spam UIDs...], dry_run=False)
+   → execute the deletion
+
+4. bulk_move_by_sender(sender_pattern="deals@store.com", dest_folder="Promotions")
+   → move all matching emails in one operation
+```
 
 ---
 
@@ -110,6 +139,14 @@ All IMAP ops use `conn.uid(...)` instead of sequence numbers. UIDs are stable ac
 
 ### IMAP MOVE Extension
 Tries RFC 6851 `MOVE` command first; falls back to `COPY` + `STORE \Deleted` + `EXPUNGE` if the server doesn't support it.
+
+### Bulk Analysis — Envelope-Only Fetch
+`analyze_emails` uses `BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)]` rather than full RFC822 bodies or the IMAP ENVELOPE command. Python's `email` library parses the returned header lines and `_decode_header_value()` handles RFC2047-encoded subjects (e.g. `=?UTF-8?Q?...?=`). The `.PEEK` modifier prevents messages from being marked as read. Classification runs locally in `email_classifier.py` using keyword/domain/pattern heuristics with confidence scores. This keeps the entire analysis under ~15K tokens regardless of how many emails are processed — solving the 200K token limit problem that occurs when reading emails individually.
+
+The original ENVELOPE approach was replaced because Yahoo's IMAP server returns complex nested address structures that the regex parser couldn't reliably extract subject and sender from, resulting in empty fields and everything being classified as "keep".
+
+### Bulk Move
+`move_emails_bulk` passes a comma-separated UID set to a single IMAP `MOVE` command, moving any number of emails in one round-trip connection.
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## What Was Built
 
-A local Python MCP (Model Context Protocol) server that gives Claude Code full access to a Yahoo Mail account via IMAP and SMTP. The server runs locally on your machine, keeping credentials private, and exposes 10 email tools that Claude Code can call conversationally.
+A local Python MCP (Model Context Protocol) server that gives Claude Code full access to a Yahoo Mail account via IMAP and SMTP. The server runs locally on your machine, keeping credentials private, and exposes 14 email tools that Claude Code can call conversationally — including bulk mail analysis that classifies an entire inbox slice without hitting Claude's token limits.
 
 ---
 
@@ -12,6 +12,7 @@ A local Python MCP (Model Context Protocol) server that gives Claude Code full a
 Yahoo_IMAP_MCP/
 ├── Yahoo_IMAP_MCP.md              # Full architecture docs and setup guide
 ├── project_summary.md             # This file
+├── bulk_mail_tool_feature.md      # Design spec for the bulk analysis feature
 ├── .mcp.json                      # Project-scoped Claude Code MCP registration
 ├── .env.example                   # Credentials template
 ├── .gitignore                     # Excludes .env and Python cache files
@@ -19,8 +20,9 @@ Yahoo_IMAP_MCP/
 └── src/
     └── yahoo_imap_mcp/
         ├── __init__.py
-        ├── server.py              # FastMCP entry point + all 10 @tool decorators
-        ├── imap_client.py         # All IMAP read/move/delete operations
+        ├── server.py              # FastMCP entry point + all 14 @tool decorators
+        ├── imap_client.py         # All IMAP read/move/delete/bulk operations
+        ├── email_classifier.py    # Heuristic spam/ad/important classifier
         ├── smtp_client.py         # SMTP send via Yahoo port 465 SSL
         ├── email_parser.py        # RFC822 bytes → structured Python dict
         ├── email_builder.py       # MIME message construction (send/reply/forward)
@@ -30,6 +32,8 @@ Yahoo_IMAP_MCP/
 ---
 
 ## Tools Exposed to Claude Code
+
+### Single-email tools (original 10)
 
 | Tool | Description |
 |------|-------------|
@@ -44,6 +48,15 @@ Yahoo_IMAP_MCP/
 | `reply_email` | Reply with proper threading headers (In-Reply-To, References) |
 | `forward_email` | Forward with original message quoted in body |
 
+### Bulk analysis tools (added)
+
+| Tool | Description |
+|------|-------------|
+| `analyze_emails` | Classify up to 200 emails by date range into spam / ads / important / keep / uncertain — envelope-only, no full body fetch |
+| `bulk_delete_by_category` | Move a list of UIDs to Trash; `dry_run=True` by default for safety |
+| `bulk_move_by_sender` | Find all emails matching a sender pattern and move them to a folder |
+| `get_sender_statistics` | Rank senders by volume over N days with suggested actions |
+
 ---
 
 ## Key Technical Decisions
@@ -54,6 +67,9 @@ Yahoo_IMAP_MCP/
 - **IMAP MOVE extension** — Tries RFC 6851 `MOVE` first; falls back to `COPY` + `STORE \Deleted` + `EXPUNGE` for compatibility.
 - **html.parser** — BeautifulSoup uses Python's built-in HTML parser for HTML-to-text conversion; no C extension required.
 - **Yahoo SMTP on port 465** — Uses `SMTP_SSL` (full SSL from handshake), not `STARTTLS` on port 587, which is required for Yahoo.
+- **Header-fields bulk analysis** — `analyze_emails` fetches `BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)]` rather than full RFC822 bodies or the IMAP ENVELOPE command. Python's `email` library parses the header lines and RFC2047-encoded subjects are decoded via `_decode_header_value()`. The original ENVELOPE regex approach produced empty subjects/senders against Yahoo's server (nested address structures), causing everything to classify as "keep". Classifying 50 emails costs ~15K tokens vs ~260K+ when reading each email individually.
+- **Heuristic classifier** — `email_classifier.py` uses keyword/domain/pattern matching with confidence scores. Priority order: spam → important → advertisements → keep. No external API calls required.
+- **Bulk move in single session** — `move_emails_bulk` passes a comma-separated UID set to a single IMAP MOVE/COPY command, avoiding one connection per email.
 
 ---
 
@@ -123,6 +139,14 @@ Once registered, open a Claude Code session and try:
 - *"Read email UID 12345"*
 - *"Move that email to my Work folder"*
 - *"Send an email to jane@example.com with subject 'Hello' and body 'Testing the MCP server'"*
+
+**Bulk analysis flow:**
+
+- *"Analyze my inbox for the last 2 days"* → calls `analyze_emails`
+- *"Delete all the spam ones"* → calls `bulk_delete_by_category` with `dry_run=True` first
+- *"Yes, go ahead and delete them"* → confirms, calls with `dry_run=False`
+- *"Who sends me the most email over the last 30 days?"* → calls `get_sender_statistics`
+- *"Move everything from deals@store.com to my Promotions folder"* → calls `bulk_move_by_sender`
 
 ---
 
