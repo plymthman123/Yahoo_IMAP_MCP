@@ -11,6 +11,10 @@ import asyncio
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import logging
+import logging.handlers
+import os
+import socket
 
 from mcp.server.fastmcp import FastMCP
 
@@ -20,6 +24,23 @@ mcp = FastMCP(name="yahoo-mail")
 
 # Thread pool for blocking IMAP/SMTP calls (max 3 concurrent connections)
 _executor = ThreadPoolExecutor(max_workers=3)
+
+# Action-confirmation logger — same syslog destination as imap_client
+_logger = logging.getLogger("yahoo-mcp-actions")
+if not _logger.handlers:
+    _handler = logging.handlers.SysLogHandler(
+        address="/var/run/syslog-ng-custom.sock",
+        facility=logging.handlers.SysLogHandler.LOG_LOCAL0,
+        socktype=socket.SOCK_DGRAM,
+    )
+    _handler.ident = "yahoo-mcp-actions: "
+    _logger.addHandler(_handler)
+    _logger.propagate = False
+_logger.setLevel(logging.DEBUG if os.environ.get("YAHOO_MCP_DEBUG") else logging.INFO)
+
+
+def _action(msg: str) -> None:
+    _logger.info(msg)
 
 
 async def _run(fn, *args, **kwargs):
@@ -177,6 +198,7 @@ async def move_email(uid: str, source_folder: str, dest_folder: str) -> dict:
         {"moved": True, "uid": str, "to_folder": str}
     """
     await _run(imap_client.move_email, uid, source_folder, dest_folder)
+    _action(f"ACTION move_email: uid={uid} moved from '{source_folder}' to '{dest_folder}'")
     return {"moved": True, "uid": uid, "to_folder": dest_folder}
 
 
@@ -200,6 +222,7 @@ async def delete_email(uid: str, folder: str = "INBOX") -> dict:
         {"deleted": True, "uid": str, "moved_to": "Trash"}
     """
     await _run(imap_client.move_email, uid, folder, config.TRASH_FOLDER)
+    _action(f"ACTION delete_email: uid={uid} moved from '{folder}' to '{config.TRASH_FOLDER}'")
     return {"deleted": True, "uid": uid, "moved_to": config.TRASH_FOLDER}
 
 
@@ -222,6 +245,7 @@ async def mark_as_spam(uid: str, folder: str = "INBOX") -> dict:
         {"marked_as_spam": True, "uid": str, "moved_to": "Bulk Mail"}
     """
     await _run(imap_client.move_email, uid, folder, config.SPAM_FOLDER)
+    _action(f"ACTION mark_as_spam: uid={uid} moved from '{folder}' to '{config.SPAM_FOLDER}'")
     return {"marked_as_spam": True, "uid": uid, "moved_to": config.SPAM_FOLDER}
 
 
@@ -254,7 +278,9 @@ async def send_email(
         {"sent": True, "message_id": str}
     """
     msg = email_builder.build_new_email(to, subject, body, cc, body_html)
-    return await _run(smtp_client.send_message, msg)
+    result = await _run(smtp_client.send_message, msg)
+    _action(f"ACTION send_email: to={to} cc={cc or []} subject={subject!r} message_id={result.get('message_id', 'unknown')}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +314,11 @@ async def reply_email(
     msg = email_builder.build_reply(original, reply_body, reply_all)
     result = await _run(smtp_client.send_message, msg)
     result["in_reply_to"] = original.get("message_id", "")
+    _action(
+        f"ACTION reply_email: replied to uid={uid} (reply_all={reply_all}) "
+        f"in_reply_to={original.get('message_id', 'unknown')} "
+        f"message_id={result.get('message_id', 'unknown')}"
+    )
     return result
 
 
@@ -321,6 +352,11 @@ async def forward_email(
     msg = email_builder.build_forward(original, to, forward_note)
     result = await _run(smtp_client.send_message, msg)
     result["forwarded_subject"] = original.get("subject", "")
+    _action(
+        f"ACTION forward_email: forwarded uid={uid} to={to} "
+        f"subject={original.get('subject', 'unknown')!r} "
+        f"message_id={result.get('message_id', 'unknown')}"
+    )
     return result
 
 
@@ -451,6 +487,7 @@ async def bulk_delete_by_category(
         }
     """
     if dry_run:
+        _action(f"ACTION bulk_delete_by_category: DRY RUN — would move {len(uids)} emails from '{folder}' to '{config.TRASH_FOLDER}'")
         return {
             "dry_run":          True,
             "emails_to_delete": len(uids),
@@ -459,6 +496,7 @@ async def bulk_delete_by_category(
             "uids_affected":    uids,
         }
     deleted = await _run(imap_client.move_emails_bulk, uids, folder, config.TRASH_FOLDER)
+    _action(f"ACTION bulk_delete_by_category: moved {deleted} of {len(uids)} emails from '{folder}' to '{config.TRASH_FOLDER}'")
     return {
         "dry_run":          False,
         "emails_to_delete": len(uids),
@@ -516,6 +554,10 @@ async def bulk_move_by_sender(
     uids = [e["uid"] for e in result["emails"]]
 
     if dry_run or not uids:
+        _action(
+            f"ACTION bulk_move_by_sender: DRY RUN — would move {len(uids)} emails "
+            f"matching '{sender_pattern}' from '{source_folder}' to '{dest_folder}'"
+        )
         return {
             "dry_run":        dry_run,
             "sender_pattern": sender_pattern,
@@ -525,6 +567,10 @@ async def bulk_move_by_sender(
             "uids_affected":  uids,
         }
     moved = await _run(imap_client.move_emails_bulk, uids, source_folder, dest_folder)
+    _action(
+        f"ACTION bulk_move_by_sender: moved {moved} of {len(uids)} emails "
+        f"matching '{sender_pattern}' from '{source_folder}' to '{dest_folder}'"
+    )
     return {
         "dry_run":        False,
         "sender_pattern": sender_pattern,

@@ -68,7 +68,17 @@ Yahoo_IMAP_MCP/
 - **html.parser** — BeautifulSoup uses Python's built-in HTML parser for HTML-to-text conversion; no C extension required.
 - **Yahoo SMTP on port 465** — Uses `SMTP_SSL` (full SSL from handshake), not `STARTTLS` on port 587, which is required for Yahoo.
 - **Header-fields bulk analysis** — `analyze_emails` fetches `BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)]` rather than full RFC822 bodies or the IMAP ENVELOPE command. Python's `email` library parses the header lines and RFC2047-encoded subjects are decoded via `_decode_header_value()`. The original ENVELOPE regex approach produced empty subjects/senders against Yahoo's server (nested address structures), causing everything to classify as "keep". Classifying 50 emails costs ~15K tokens vs ~260K+ when reading each email individually.
-- **Heuristic classifier** — `email_classifier.py` uses keyword/domain/pattern matching with confidence scores. Priority order: spam → important → advertisements → keep. No external API calls required.
+- **Heuristic classifier** — `email_classifier.py` uses keyword/domain/pattern matching with confidence scores. Priority order: high-confidence spam (≥0.85) → important → advertisements → low-confidence spam (→ uncertain) → keep. Key design points:
+  - `_TRANSACTIONAL_DOMAINS` (financial institutions, carriers, healthcare, utilities) are spam-exempt and auto-classified as important regardless of subject.
+  - `_TRUSTED_MIXED_DOMAINS` (Amazon, Apple, Google, etc.) are spam-exempt but require a subject keyword to be classified as important, since they also send promotional mail.
+  - Suspicious TLD alone (e.g. `.ga`) returns confidence 0.50 → routes to `uncertain` instead of `spam`. Requires TLD + spammy subject to reach 0.85 spam threshold.
+  - TLD check uses `domain.endswith(tld)` (not substring) to prevent `.ga` from matching inside domains like `gavinnewsom.com`.
+  - Sender signals have three tiers: *strong* (`marketing`, `promotions`, `newsletter`, `deals`, `offers` local parts — sufficient alone), *weak* (`noreply`, `no-reply`, `donotreply`, `news`, `updates` — needs a subject signal), and *generic commercial* (`info`, `hello`, `team`, `contact`, `hi` — exact local-part match from a non-trusted domain; also needs a subject signal). Display name containing `!` counts as a weak sender signal.
+  - Ad subject keywords split into *strong* (one match sufficient: `% off`, `coupon`, `flash sale`, `debt relief`, `debt consolidation`, `pre-approved`, `free trial`, etc.) and *weak* (need combination or sender signal: `sale`, `deal`, `newsletter`, `just for you`, `act now`, `limited time`, `top picks`, etc.).
+  - Display-name impersonation detection: `"PayPal <info@scammer.tk>"` → spam (0.95).
+  - Unicode/non-ASCII in the From field → weak spam signal (0.60) → routes to `uncertain`.
+  - No external API calls required.
+- **Action-confirmation logging** — `server.py` logs every write operation to the same syslog socket as `imap_client`, under the `yahoo-mcp-actions` identity. Every tool that mutates email state emits a structured log line after success (e.g. `ACTION bulk_delete_by_category: moved 47 of 47 emails from 'INBOX' to 'Trash'`). Dry-run calls are also logged so LLM previews are distinguishable from actual executions.
 - **Bulk move in single session** — `move_emails_bulk` passes a comma-separated UID set to a single IMAP MOVE/COPY command, avoiding one connection per email.
 
 ---
