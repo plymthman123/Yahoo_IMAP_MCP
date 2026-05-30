@@ -420,11 +420,15 @@ async def analyze_emails(
     result = await _run(imap_client.fetch_envelopes_since, folder, since, limit, include_read)
     emails = result["emails"]
 
+    from . import user_prefs as _user_prefs_mod
+    prefs = _user_prefs_mod.load_prefs()
+
     categories: dict[str, list] = {
-        "spam": [], "advertisements": [], "important": [], "keep": [], "uncertain": []
+        "spam": [], "advertisements": [], "important": [], "keep": [],
+        "uncertain": [], "suggested_delete": [],
     }
     for email in emails:
-        category, reason, confidence = email_classifier.classify_email(email)
+        category, reason, confidence = email_classifier.classify_email(email, prefs)
         categories[category].append({
             "uid":        email["uid"],
             "from":       email["from"],
@@ -436,13 +440,14 @@ async def analyze_emails(
 
     return {
         "summary": {
-            "total_analyzed":  len(emails),
-            "date_range":      {"start": since, "end": datetime.now().strftime("%d-%b-%Y")},
-            "spam_count":      len(categories["spam"]),
-            "ads_count":       len(categories["advertisements"]),
-            "important_count": len(categories["important"]),
-            "keep_count":      len(categories["keep"]),
-            "uncertain_count": len(categories["uncertain"]),
+            "total_analyzed":        len(emails),
+            "date_range":            {"start": since, "end": datetime.now().strftime("%d-%b-%Y")},
+            "spam_count":            len(categories["spam"]),
+            "ads_count":             len(categories["advertisements"]),
+            "important_count":       len(categories["important"]),
+            "keep_count":            len(categories["keep"]),
+            "uncertain_count":       len(categories["uncertain"]),
+            "suggested_delete_count": len(categories["suggested_delete"]),
         },
         "categorized_emails":  categories,
         "analysis_timestamp":  datetime.now().isoformat(),
