@@ -269,11 +269,26 @@ def classify_as_important(email_data: dict) -> tuple[bool, str, float]:
     return False, "", 0.0
 
 
+_SUPPORTED_CATEGORIES = frozenset({"spam", "advertisements", "important", "keep", "uncertain"})
+_LEGACY_CATEGORY_MAP = {
+    "transactional": "important",
+    "newsletters": "advertisements",
+    "politics": "keep",
+}
+
+
+def _normalize_category(category: str) -> str | None:
+    """Return a category supported by analyze_emails, or None for unknown rules."""
+    normalized = _LEGACY_CATEGORY_MAP.get(category, category)
+    return normalized if normalized in _SUPPORTED_CATEGORIES else None
+
+
 def classify_email(email_data: dict, user_prefs: dict | None = None) -> tuple[str, str, float]:
     """
     Classify an email into one of: spam | advertisements | important | keep | uncertain.
     Returns (category, reason, confidence).
     Priority: user prefs → high-confidence spam → important → advertisements → low-confidence spam → keep.
+    Legacy preference targets are normalized so stale learned rules cannot crash analysis.
     """
     if user_prefs:
         domain = _extract_domain((email_data.get("from") or "").lower())
@@ -289,7 +304,9 @@ def classify_email(email_data: dict, user_prefs: dict | None = None) -> tuple[st
             return "suggested_delete", f"User preference: often deleted ({domain})", 0.85
         for rule in user_prefs.get("reclassify", []):
             if domain == rule.get("domain"):
-                return rule["to"], f"User preference: reclassify {domain} → {rule['to']}", 0.95
+                category = _normalize_category(rule.get("to", ""))
+                if category:
+                    return category, f"User preference: reclassify {domain} → {category}", 0.95
 
     is_spam, spam_reason, spam_conf = classify_as_spam(email_data)
 

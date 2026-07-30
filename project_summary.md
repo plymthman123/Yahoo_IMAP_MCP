@@ -53,7 +53,7 @@ Yahoo_IMAP_MCP/
 
 | Tool | Description |
 |------|-------------|
-| `analyze_emails` | Classify up to 200 emails by date range into spam / ads / important / keep / uncertain — envelope-only, no full body fetch. Applies user preferences before heuristics. |
+| `analyze_emails` | Classify up to 200 emails by date range into spam / ads / important / keep / uncertain / suggested_delete — envelope-only, no full body fetch. Applies user preferences before heuristics. |
 | `bulk_delete_by_category` | Move a list of UIDs to Trash; `dry_run=True` by default for safety |
 | `bulk_move_by_sender` | Find all emails matching a sender pattern and move them to a folder |
 | `get_sender_statistics` | Rank senders by volume over N days with suggested actions |
@@ -101,6 +101,7 @@ The classifier supports a persistent user-preferences layer that overrides heuri
   "always_delete":    ["tiktok.com"],
   "always_keep":      ["lightstream.com"],
   "always_important": ["healthequity.com"],
+  "suggested_delete": ["newsletters.llbean.com"],
   "reclassify": [
     {"domain": "llbean.com", "from": "important", "to": "advertisements"}
   ],
@@ -117,16 +118,18 @@ The classifier supports a persistent user-preferences layer that overrides heuri
 | `always_delete` | Returns `"spam"` (routed to trash) | 1.0 |
 | `always_important` | Returns `"important"` | 1.0 |
 | `always_keep` | Returns `"keep"` (never spam or ads) | 1.0 |
+| `suggested_delete` | Returns `"suggested_delete"` — surfaced as a separate review bucket | 0.85 |
 | `reclassify` | Returns the `to` category for the matching domain | 0.95 |
 
 ### How Rules Get Updated
 
-The AI Chat Assistant's Yahoo Mail Agent includes a post-session learner (`agents/yahoo_email/learner.py`) that fires automatically when the user clicks **Done / Return to Chat**. It:
-1. Parses the session's full API history to identify which emails were deleted/spammed/moved and their senders
-2. Sends a compact action summary to the OpenAI model with instructions to extract high-confidence domain rules
-3. Merges proposed additions into the prefs file (existing rules are never removed; the file only grows)
+The AI Chat Assistant's Yahoo Mail Agent includes a post-session learner (`agents/yahoo_email/learner.py`) that fires automatically when the user clicks **Done / Return to Chat**. It makes three passes over the session API history:
 
-The learner will not propose rules for transactional senders (banks, carriers, PayPal) or major platforms (Amazon, Google, Apple, Microsoft).
+1. **Write actions** — identifies which emails were deleted, spammed, or moved, and their original classification
+2. **Misclassified deletes** — flags emails the user deleted that the classifier thought were "important" or "keep", signalling a classification error. Even a single such deletion is enough to propose a `reclassify` or `suggested_delete` rule
+3. **Explicit preferences** — scans user message text for direct preference statements ("always suggest deleting emails from x.com", "never show me emails from y.com"). A single clear statement produces a rule immediately, no action required
+
+All proposed additions are merged into the prefs file (existing rules are never removed; the file only grows). The learner will not propose rules for transactional senders (banks, carriers, PayPal) or major platforms (Amazon, Google, Apple, Microsoft).
 
 ---
 

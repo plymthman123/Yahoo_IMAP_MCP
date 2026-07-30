@@ -60,8 +60,22 @@ def merge_proposed(current: dict, proposed: dict) -> dict:
     if "reclassify" in proposed:
         existing_rc = list(merged.get("reclassify", []))
         existing_domains = {r["domain"] for r in existing_rc}
+        supported_categories = {"spam", "advertisements", "important", "keep", "uncertain"}
+        category_aliases = {
+            "transactional": "important",
+            "newsletters": "advertisements",
+            "politics": "keep",
+        }
         for rule in proposed["reclassify"]:
-            if rule.get("domain") not in existing_domains:
-                existing_rc.append(rule)
+            if not isinstance(rule, dict) or not rule.get("domain"):
+                continue
+            target = category_aliases.get(rule.get("to"), rule.get("to"))
+            if target not in supported_categories:
+                logger.warning("Ignoring unsupported reclassification target: %r", rule.get("to"))
+                continue
+            normalized_rule = dict(rule)
+            normalized_rule["to"] = target
+            if normalized_rule["domain"] not in existing_domains:
+                existing_rc.append(normalized_rule)
         merged["reclassify"] = existing_rc
     return merged
