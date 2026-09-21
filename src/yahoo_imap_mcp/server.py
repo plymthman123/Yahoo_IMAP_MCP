@@ -15,6 +15,8 @@ import logging
 import logging.handlers
 import os
 import socket
+import time
+import uuid
 
 from mcp.server.fastmcp import FastMCP
 
@@ -38,9 +40,63 @@ if not _logger.handlers:
     _logger.propagate = False
 _logger.setLevel(logging.DEBUG if os.environ.get("YAHOO_MCP_DEBUG") else logging.INFO)
 
+_REVIEW_CYCLE_TTL_SECONDS = 30 * 60
+_unread_review_cycle: dict | None = None
+
 
 def _action(msg: str) -> None:
     _logger.info(msg)
+
+
+def _unique_uids(uids: list[str]) -> list[str]:
+    """Keep the first occurrence of each UID while preserving order."""
+    return list(dict.fromkeys(str(uid) for uid in uids))
+
+
+def _get_active_unread_cycle() -> dict | None:
+    """Return the active cycle, expiring it after inactivity."""
+    global _unread_review_cycle
+    if _unread_review_cycle is None:
+        return None
+    if time.monotonic() - _unread_review_cycle["last_accessed"] > _REVIEW_CYCLE_TTL_SECONDS:
+        _unread_review_cycle = None
+        return None
+    _unread_review_cycle["last_accessed"] = time.monotonic()
+    return _unread_review_cycle
+
+
+def _start_unread_cycle(folder: str, days_back: int | None) -> dict:
+    global _unread_review_cycle
+    _unread_review_cycle = {
+        "cycle_id": uuid.uuid4().hex,
+        "folder": folder,
+        "days_back": days_back,
+        "uids": {},
+        "last_accessed": time.monotonic(),
+    }
+    return _unread_review_cycle
+
+
+def _cycle_for_unread_analysis(
+    folder: str, days_back: int | None, before_uid: str | None,
+) -> dict:
+    """Continue only a compatible cursor page; otherwise start a new cycle."""
+    cycle = _get_active_unread_cycle()
+    if (
+        before_uid is not None
+        and cycle is not None
+        and cycle["folder"] == folder
+        and cycle["days_back"] == days_back
+    ):
+        return cycle
+    return _start_unread_cycle(folder, days_back)
+
+
+def _require_unread_cycle(cycle_id: str) -> dict:
+    cycle = _get_active_unread_cycle()
+    if cycle is None or cycle["cycle_id"] != cycle_id:
+        raise ValueError("Unread review cycle is missing or expired; run a new unread review")
+    return cycle
 
 
 async def _run(fn, *args, **kwargs):
@@ -367,9 +423,10 @@ async def forward_email(
 @mcp.tool()
 async def analyze_emails(
     folder: str = "INBOX",
-    days_back: int = 2,
+    days_back: int | None = 2,
     limit: int = 50,
     include_read: bool = True,
+    before_uid: str | None = None,
 ) -> dict:
     """
     READ-ONLY. Call this immediately — no user permission needed.
@@ -388,11 +445,31 @@ async def analyze_emails(
     to take actions (delete spam, move ads, etc.) — but wait for explicit user
     confirmation before calling any write tool.
 
+    For an unread request, call with include_read=False and days_back=None
+    unless the user explicitly requests a date range. For "next batch", pass
+    the prior response's next_cursor as before_uid only when has_more is true
+    and next_cursor is a numeric UID. Never pass null, None, or the string
+    "None" as before_uid. If the prior unread result was empty, had no cursor,
+    or was an explicitly date-limited search and the user asks for another
+    unqualified batch, start an all-history unread review with days_back=None
+    and before_uid=None. Do not pass the cursor for a refresh; a refresh
+    intentionally returns a new snapshot of the newest matching messages. Do
+    not invent a shorter date window such as seven days for another batch of
+    unread mail.
+
+    If a cursor is invalid, retry as a new all-history unread review rather
+    than passing the invalid value again.
+
     Args:
         folder:       IMAP folder to analyze. Default: "INBOX".
-        days_back:    How many days back to include. Default: 2.
+        days_back:    How many days back to include. Default: 2. Use None for
+                      all available history, especially for an unqualified
+                      request for the most recent unread messages.
         limit:        Maximum emails to analyze (1–200). Default: 50.
-        include_read: Include already-read emails. Default: True.
+        include_read: Include already-read emails. Default: True. Set False
+                      when the user requests unread mail.
+        before_uid:   Return only messages older than this UID for paging.
+                      Use next_cursor from the previous response.
 
     Returns:
         {
@@ -412,13 +489,38 @@ async def analyze_emails(
             "keep":           [...],
             "uncertain":      [...]
           },
-          "analysis_timestamp": str
+          "analysis_timestamp": str,
+          "cycle_id": str | null,
+          "pagination": {"has_more": bool, "next_cursor": str | null}
         }
     """
     limit = min(max(1, limit), 200)
-    since = (datetime.now() - timedelta(days=days_back)).strftime("%d-%b-%Y")
-    result = await _run(imap_client.fetch_envelopes_since, folder, since, limit, include_read)
+    if before_uid is not None and not str(before_uid).isdigit():
+        raise ValueError(
+            "Invalid unread paging cursor. Start a new unread review with "
+            "days_back=None and before_uid=None."
+        )
+    since = (
+        (datetime.now() - timedelta(days=days_back)).strftime("%d-%b-%Y")
+        if days_back is not None
+        else None
+    )
+    result = await _run(
+        imap_client.fetch_envelopes_since,
+        folder,
+        since,
+        limit,
+        include_read,
+        before_uid,
+    )
     emails = result["emails"]
+
+    # An empty, explicitly date-limited unread search is not a pageable
+    # review cycle. A later unqualified "another batch" must start an
+    # all-history unread review rather than inherit an empty date window.
+    cycle = None
+    if not include_read and (emails or days_back is None or before_uid is not None):
+        cycle = _cycle_for_unread_analysis(folder, days_back, before_uid)
 
     from . import user_prefs as _user_prefs_mod
     prefs = _user_prefs_mod.load_prefs()
@@ -438,6 +540,17 @@ async def analyze_emails(
             "confidence": round(confidence, 2),
         })
 
+    if cycle is not None:
+        for category, items in categories.items():
+            for item in items:
+                cycle["uids"][item["uid"]] = {
+                    "category": category,
+                    "from": item["from"],
+                    "subject": item["subject"],
+                    "date": item["date"],
+                }
+        cycle["last_accessed"] = time.monotonic()
+
     return {
         "summary": {
             "total_analyzed":        len(emails),
@@ -451,6 +564,11 @@ async def analyze_emails(
         },
         "categorized_emails":  categories,
         "analysis_timestamp":  datetime.now().isoformat(),
+        "cycle_id":             cycle["cycle_id"] if cycle is not None else None,
+        "pagination": {
+            "has_more": result["has_more"],
+            "next_cursor": result["next_cursor"],
+        },
     }
 
 
@@ -460,50 +578,106 @@ async def analyze_emails(
 
 @mcp.tool()
 async def bulk_delete_by_category(
-    uids: list[str],
+    uids: list[str] | None = None,
     folder: str = "INBOX",
     dry_run: bool = True,
+    scope: str = "selected",
+    expected_count: int | None = None,
+    cycle_id: str | None = None,
 ) -> dict:
     """
     WRITE OPERATION. Always call with dry_run=True first, show the user the list
     of emails that would be deleted, and only call with dry_run=False after the
     user explicitly says "yes, delete them" or equivalent.
 
-    Move multiple emails to Trash by UID. Designed to be used after analyze_emails
-    — pass the uid list from whichever category the user approved for deletion.
+    Move multiple emails to Trash. Category labels are not deletion
+    instructions: if the user says "delete all of them" after an unread review,
+    use scope="review_cycle" with the cycle_id returned by analyze_emails.
+    The server then resolves every UID in that in-memory review cycle. If the
+    user names a category, pass only that category's UIDs with scope="selected"
+    and the same cycle_id.
+
+    scope="latest_batch" is retained as a compatibility fallback and requires
+    expected_count equal to the displayed batch size; new callers should prefer
+    scope="review_cycle" so the server, rather than the model, owns the batch
+    membership.
 
     Workflow:
-        1. analyze_emails() → get categorized uid lists
-        2. bulk_delete_by_category(uids=[...], dry_run=True) → show user what will be deleted
-        3. User confirms → bulk_delete_by_category(uids=[...], dry_run=False) → execute
+        1. analyze_emails() → get the complete displayed batch and category UIDs
+        2. bulk_delete_by_category(..., scope=..., expected_count=..., dry_run=True)
+        3. Show the exact count and list; obtain explicit confirmation
+        4. Repeat the identical request with dry_run=False
 
     Args:
-        uids:     List of IMAP UIDs to delete (move to Trash).
-        folder:   Source folder. Default: "INBOX".
-        dry_run:  If True (default), return what would be deleted without acting.
+        uids:           List of IMAP UIDs to delete (move to Trash).
+        folder:         Source folder. Default: "INBOX".
+        dry_run:        If True (default), return what would be deleted without acting.
+        scope:          "selected" for named categories/messages, or
+                        "latest_batch" for every email in the latest displayed batch.
+        expected_count: Required for scope="latest_batch"; total emails displayed.
 
     Returns:
         {
           "dry_run": bool,
+          "scope": str,
+          "cycle_id": str | null,
           "emails_to_delete": int,
           "emails_deleted": int,
           "moved_to": str,
           "uids_affected": [str]
         }
     """
+    if scope not in {"selected", "latest_batch", "review_cycle"}:
+        raise ValueError("scope must be 'selected', 'latest_batch', or 'review_cycle'")
+
+    if scope == "review_cycle":
+        if cycle_id is None:
+            raise ValueError("cycle_id is required for scope='review_cycle'")
+        cycle = _require_unread_cycle(cycle_id)
+        uids = list(cycle["uids"])
+        folder = cycle["folder"]
+    else:
+        uids = _unique_uids(uids or [])
+        if cycle_id is not None:
+            cycle = _require_unread_cycle(cycle_id)
+            unknown = [uid for uid in uids if uid not in cycle["uids"]]
+            if unknown:
+                raise ValueError(f"UIDs are not in the review cycle: {unknown}")
+
+    if scope == "latest_batch":
+        if expected_count is None:
+            raise ValueError("expected_count is required for scope='latest_batch'")
+        if expected_count < 0:
+            raise ValueError("expected_count must be non-negative")
+        if len(uids) != expected_count:
+            raise ValueError(
+                f"latest_batch count mismatch: received {len(uids)} unique UIDs, "
+                f"expected {expected_count}"
+            )
+
     if dry_run:
-        _action(f"ACTION bulk_delete_by_category: DRY RUN — would move {len(uids)} emails from '{folder}' to '{config.TRASH_FOLDER}'")
+        _action(f"ACTION bulk_delete_by_category: DRY RUN — would move {len(uids)} emails from '{folder}' to '{config.TRASH_FOLDER}' scope={scope}")
         return {
             "dry_run":          True,
+            "scope":            scope,
+            "cycle_id":         cycle_id,
+            "expected_count":   expected_count,
             "emails_to_delete": len(uids),
             "emails_deleted":   0,
             "moved_to":         config.TRASH_FOLDER,
             "uids_affected":    uids,
         }
     deleted = await _run(imap_client.move_emails_bulk, uids, folder, config.TRASH_FOLDER)
-    _action(f"ACTION bulk_delete_by_category: moved {deleted} of {len(uids)} emails from '{folder}' to '{config.TRASH_FOLDER}'")
+    if scope == "review_cycle":
+        for uid in uids:
+            _unread_review_cycle["uids"].pop(uid, None)
+    _action(f"ACTION bulk_delete_by_category: moved {deleted} of {len(uids)} emails from '{folder}' to '{config.TRASH_FOLDER}' scope={scope}")
     return {
         "dry_run":          False,
+        "scope":            scope,
+        "cycle_id":         cycle_id,
+        "expected_count":   expected_count,
+
         "emails_to_delete": len(uids),
         "emails_deleted":   deleted,
         "moved_to":         config.TRASH_FOLDER,
@@ -556,7 +730,7 @@ async def bulk_move_by_sender(
         imap_client.search_emails,
         source_folder, sender_pattern, None, since, None, False, 200, 0,
     )
-    uids = [e["uid"] for e in result["emails"]]
+    uids = _unique_uids([e["uid"] for e in result["emails"]])
 
     if dry_run or not uids:
         _action(

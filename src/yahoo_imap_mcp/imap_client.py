@@ -302,24 +302,49 @@ def move_emails_bulk(uids: list[str], source_folder: str, dest_folder: str) -> i
 
 def fetch_envelopes_since(
     folder: str,
-    since: str,
+    since: str | None,
     limit: int,
     include_read: bool = True,
+    before_uid: str | None = None,
 ) -> dict:
     """
-    Fetch envelope data for emails since a given IMAP date string (DD-Mon-YYYY).
-    Returns {"emails": [...], "total": int}.
+    Fetch envelope data, optionally limited to messages since an IMAP date.
+
+    Results are newest-first. When ``before_uid`` is supplied, only messages
+    with lower UIDs are considered, allowing callers to request a subsequent
+    batch without relying on mutable server-side state. When ``since`` is
+    omitted, the search covers the entire selected folder.
     """
-    criteria = f"SINCE {since}" if include_read else f"UNSEEN SINCE {since}"
-    _log(f"fetch_envelopes_since(folder={folder!r}, since={since!r}, limit={limit})")
+    if include_read:
+        criteria = f"SINCE {since}" if since else "ALL"
+    else:
+        criteria = f"UNSEEN SINCE {since}" if since else "UNSEEN"
+    _log(
+        f"fetch_envelopes_since(folder={folder!r}, since={since!r}, "
+        f"limit={limit}, include_read={include_read}, before_uid={before_uid!r})"
+    )
     with imap_connection() as conn:
         conn.select(f'"{folder}"', readonly=True)
         status, data = conn.uid("SEARCH", None, criteria)
         if status != "OK":
             raise RuntimeError(f"IMAP SEARCH failed: {data}")
         all_uids = data[0].split() if data[0] else []
+        if before_uid is not None:
+            try:
+                cursor = int(before_uid)
+            except ValueError as exc:
+                raise ValueError("before_uid must be a numeric IMAP UID") from exc
+            all_uids = [uid for uid in all_uids if int(uid) < cursor]
+
         total = len(all_uids)
-        sliced = list(reversed(all_uids))[:limit]
+        newest_first = list(reversed(all_uids))
+        sliced = newest_first[:limit]
         emails = _fetch_envelopes(conn, sliced)
+        next_cursor = emails[-1]["uid"] if emails else None
         _log(f"fetch_envelopes_since returning {len(emails)} of {total}")
-        return {"emails": emails, "total": total}
+        return {
+            "emails": emails,
+            "total": total,
+            "has_more": len(newest_first) > len(sliced),
+            "next_cursor": next_cursor,
+        }
